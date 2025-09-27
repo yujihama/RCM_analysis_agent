@@ -1,69 +1,53 @@
-"""データ処理ロジック。"""
-
 from __future__ import annotations
 
-from dataclasses import asdict
-from typing import Iterable, Mapping, Optional, Sequence
+import json
+from typing import Dict, List
 
 import pandas as pd
 
-from .llm_client import allowed_roles
-from .rules import ColumnRule, ColumnRole, CombineRule, RuleSet
+from .types import ColumnLabel, LABEL_OPTIONS
 
 
-def generate_rule_prompt_payload(
-    df: pd.DataFrame,
-    sample_size: int = 5,
-    reference: Optional[Mapping[str, object]] = None,
-) -> Mapping[str, object]:
-    """LLM に渡すプロンプト用の情報を組み立てる。"""
-
-    payload = {
-        "instruction": "RCM テーブルのカラム役割を判定してください。",
-        "columns": list(df.columns),
-        "samples": df.head(sample_size).to_dict(orient="records"),
-        "allowed_roles": list(allowed_roles()),
-    }
-    if reference:
-        payload["reference_pattern"] = reference
-    return payload
+MAIN_LABEL_ORDER: List[ColumnLabel] = [
+    "リスク",
+    "コントロール",
+    "手続",
+    "前回の手続結果",
+    "その他",
+]
 
 
-def build_rule_set(column_mapping: Mapping[str, str], combine_rules: Iterable[Mapping[str, str]]) -> RuleSet:
-    return RuleSet.from_mapping(column_mapping=column_mapping, combine_rules=combine_rules)
+def _columns_by_label(column_labels: Dict[str, ColumnLabel], df: pd.DataFrame) -> Dict[ColumnLabel, List[str]]:
+    present = set(df.columns.astype(str).tolist())
+    by_label: Dict[ColumnLabel, List[str]] = {label: [] for label in MAIN_LABEL_ORDER}
+    for col, label in column_labels.items():
+        if col in present:
+            by_label[label].append(col)
+    return by_label
 
 
-def apply_rules(df: pd.DataFrame, rules: RuleSet) -> pd.DataFrame:
-    return rules.apply(df)
+def _jsonify_row(row: pd.Series, cols: List[str]) -> str:
+    payload = {col: (None if pd.isna(row[col]) or row[col] == "" else row[col]) for col in cols}
+    return json.dumps(payload, ensure_ascii=False)
 
 
-def export_rules(rules: RuleSet) -> Mapping[str, object]:
-    return {
-        "column_rules": [
-            {
-                "column": rule.column,
-                "role": rule.role.value,
-            }
-            for rule in rules.column_rules
-        ],
-        "combine_rules": [asdict(rule) for rule in rules.combine_rules],
-    }
+def apply_label_rules(df: pd.DataFrame, column_labels: Dict[str, ColumnLabel]) -> pd.DataFrame:
+    """
+    ラベルに基づき、出力用の5カラム（リスク/コントロール/手続/前回の手続結果/その他）を作成する。
+    同一ラベルに複数カラムが紐づく場合、そのセルは {元カラム名: 値} のJSON文字列にする。
+    """
+    by_label = _columns_by_label(column_labels, df)
+
+    out = pd.DataFrame(index=df.index)
+    for label in MAIN_LABEL_ORDER:
+        cols = by_label.get(label, [])
+        if len(cols) == 0:
+            out[label] = ""
+        elif len(cols) == 1:
+            out[label] = df[cols[0]]
+        else:
+            out[label] = df.apply(lambda r: _jsonify_row(r, cols), axis=1)
+
+    return out
 
 
-def ensure_column_rules(df: pd.DataFrame, mapping: Mapping[str, str]) -> Sequence[ColumnRule]:
-    return [
-        ColumnRule(column=column, role=ColumnRole.from_label(mapping.get(column, "その他")))
-        for column in df.columns
-    ]
-
-
-def infer_combine_rules(selection: Mapping[str, Mapping[str, object]]) -> Iterable[CombineRule]:
-    combines: list[CombineRule] = []
-    for key, payload in selection.items():
-        sources = payload.get("columns", [])
-        if not isinstance(sources, (list, tuple)) or not sources:
-            continue
-        target_name = str(payload.get("new_column", key))
-        separator = str(payload.get("separator", "\n"))
-        combines.append(CombineRule(sources=list(sources), target_name=target_name, separator=separator))
-    return combines
