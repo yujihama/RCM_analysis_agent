@@ -20,6 +20,21 @@ pattern_repository = PatternRepository()
 
 st.set_page_config(page_title="RCM 情報抽出エージェント", layout="wide")
 
+env_llm_config = LLMConfiguration.from_env()
+
+if "llm_api_key" not in st.session_state:
+    st.session_state.llm_api_key = env_llm_config.api_key or ""
+
+with st.sidebar:
+    st.header("設定")
+    api_key_input = st.text_input(
+        "LLM API キー",
+        value=st.session_state.llm_api_key,
+        type="password",
+        help="OpenAI 互換 API キーを入力してください。入力値はこのセッション内でのみ保持されます。",
+    )
+    st.session_state.llm_api_key = api_key_input
+
 st.title("RCM 情報抽出エージェント (MVP)")
 st.markdown(
     """
@@ -59,33 +74,61 @@ if uploaded_file is not None:
         st.dataframe(df.head(20))
 
         with st.spinner("LLM によるカラム役割を推論中..."):
-            client = LLMClient(LLMConfiguration.from_env())
-            summary = client.summarize_dataframe(df)
-            st.session_state.pattern_summary = summary
-            similar_candidates = pattern_repository.find_similar(
-                summary=summary,
-                columns=df.columns,
-                limit=1,
+            api_key = st.session_state.llm_api_key or env_llm_config.api_key
+            llm_config = LLMConfiguration(
+                api_key=api_key or None,
+                model=env_llm_config.model,
+                temperature=env_llm_config.temperature,
             )
+            llm_error: Optional[LLMError] = None
+            summary = ""
+            suggestions: Dict[str, str] = {}
+            reference_record = None
+            reference_message: Optional[str] = None
             reference_payload: Optional[Dict[str, object]] = None
-            if similar_candidates:
-                reference_record, score = similar_candidates[0]
-                st.session_state.reference_pattern = reference_record
-                reference_payload = dict(build_reference_payload(reference_record))
-                st.info(
-                    f"過去のパターン『{reference_record.name}』(スコア {score:.2f}) を参照して提案を生成します。"
-                )
-            else:
-                st.session_state.reference_pattern = None
+
             try:
-                suggestions = client.suggest_column_roles(df, reference=reference_payload)
+                client = LLMClient(llm_config)
             except LLMError as exc:
-                st.warning(f"LLM を利用できませんでした。ヒューリスティックな推論を利用します: {exc}")
-                suggestions = client.fallback_column_roles(df)
-            st.session_state.column_mapping = dict(suggestions)
-            default_name = uploaded_file.name.rsplit(".", 1)[0]
-            st.session_state.pattern_name = f"{default_name} パターン"
-            st.session_state.saved_pattern_id = None
+                llm_error = exc
+            else:
+                try:
+                    summary = client.summarize_dataframe(df)
+                except LLMError as exc:
+                    llm_error = exc
+                else:
+                    similar_candidates = pattern_repository.find_similar(
+                        summary=summary,
+                        columns=df.columns,
+                        limit=1,
+                    )
+                    if similar_candidates:
+                        reference_record, score = similar_candidates[0]
+                        reference_payload = dict(build_reference_payload(reference_record))
+                        reference_message = (
+                            f"過去のパターン『{reference_record.name}』(スコア {score:.2f}) を参照して提案を生成します。"
+                        )
+                    try:
+                        suggestions = client.suggest_column_roles(
+                            df,
+                            reference=reference_payload,
+                        )
+                    except LLMError as exc:
+                        llm_error = exc
+
+            if llm_error:
+                st.session_state.pattern_summary = ""
+                st.session_state.reference_pattern = None
+                st.error(f"LLM の呼び出しでエラーが発生しました: {llm_error}")
+            else:
+                st.session_state.pattern_summary = summary
+                st.session_state.reference_pattern = reference_record
+                if reference_message:
+                    st.info(reference_message)
+                st.session_state.column_mapping = dict(suggestions)
+                default_name = uploaded_file.name.rsplit(".", 1)[0]
+                st.session_state.pattern_name = f"{default_name} パターン"
+                st.session_state.saved_pattern_id = None
 
 if st.session_state.dataframe is not None:
     df = st.session_state.dataframe

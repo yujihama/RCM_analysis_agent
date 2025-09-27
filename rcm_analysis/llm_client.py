@@ -1,7 +1,6 @@
 """LLM クライアントモジュール。
 
 OpenAI API を利用して DataFrame の構造を推論するための補助関数を提供します。
-実行環境で API キーが設定されていない場合は、フォールバックとしてヒューリスティックな推論結果を返します。
 """
 
 from __future__ import annotations
@@ -74,7 +73,7 @@ class LLMClient:
         if df.empty:
             return {}
         if not self.config.api_key or self._client is None:
-            return self._heuristic_guess(df)
+            raise LLMError("API キーが設定されていないため LLM を利用できません。")
 
         payload = self._build_prompt(df, sample_size, reference)
         try:
@@ -147,7 +146,7 @@ class LLMClient:
         if df.empty:
             return ""
         if not self.config.api_key or self._client is None:
-            return self._fallback_summary(df)
+            raise LLMError("API キーが設定されていないため LLM を利用できません。")
 
         payload = {
             "instruction": "与えられた RCM テーブルの構造と特徴を 3 文以内で要約してください。",
@@ -161,8 +160,8 @@ class LLMClient:
                 input=json.dumps(payload, ensure_ascii=False),
             )
             return response.output_text.strip()  # type: ignore[attr-defined]
-        except Exception:
-            return self._fallback_summary(df)
+        except Exception as exc:
+            raise LLMError("LLM からの要約取得に失敗しました。") from exc
 
     def _fallback_summary(self, df: pd.DataFrame) -> str:
         if len(df.columns) == 0:
