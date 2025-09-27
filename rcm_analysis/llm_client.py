@@ -56,7 +56,6 @@ def suggest_header_and_labels(
         model=model,
         messages=messages,
         response_format={"type": "json_object"},
-        temperature=0.1,
     )
     content = completion.choices[0].message.content
     if not content:
@@ -67,5 +66,28 @@ def suggest_header_and_labels(
         raise ValueError(f"LLM応答のJSONパースに失敗しました: {e}\ncontent={content}")
 
     return HeaderAndLabels.model_validate(data)
+
+
+def summarize_columns(api_key: str, model: str, columns: List[str]) -> str:
+    client = get_openai_client(api_key)
+    prompt = (
+        "以下はRCMのカラム名一覧です。フォーマットの特徴を短く要約してください。"
+        "用途や文脈が分かる表現で100字程度、日本語で。\n\n"
+        + "\n".join(columns)
+    )
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": "監査文脈の要約アシスタント"},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return completion.choices[0].message.content or ""
+
+
+def embed_texts(api_key: str, embedding_model: str, texts: List[str]) -> List[List[float]]:
+    client = get_openai_client(api_key)
+    res = client.embeddings.create(model=embedding_model, input=texts)
+    return [d.embedding for d in res.data]
 
 

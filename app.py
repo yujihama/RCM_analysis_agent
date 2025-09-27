@@ -10,9 +10,10 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from rcm_analysis.io import extract_sample_rows, compute_file_hash, read_dataframe_with_header
-from rcm_analysis.llm_client import suggest_header_and_labels
+from rcm_analysis.llm_client import suggest_header_and_labels, summarize_columns, embed_texts
 from rcm_analysis.types import HeaderAndLabels, LABEL_OPTIONS, ColumnLabel
 from rcm_analysis.data_processing import apply_label_rules
+from rcm_analysis.patterns import PatternDB, load_db, save_db, search_similar, upsert_pattern
 
 
 load_dotenv()
@@ -32,6 +33,8 @@ with st.sidebar:
     default_api_key = os.environ.get("OPENAI_API_KEY", "")
     api_key = st.text_input("OpenAI API Key", value=default_api_key, type="password")
     model = st.text_input("モデル名", value=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
+    embedding_model = st.text_input("埋め込みモデル名", value=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"))
+    pattern_path = st.text_input("パターンDBパス", value=os.environ.get("PATTERN_DB_PATH", "patterns.json"))
     st.caption("エラーはフォールバックせずそのまま表示します")
 
 
@@ -55,6 +58,7 @@ if uploaded is not None:
                     sample = extract_sample_rows(file_bytes, uploaded.name, max_rows=10)
                     hal: HeaderAndLabels = suggest_header_and_labels(api_key=api_key, model=model, sample_rows=sample)
                     st.session_state["header_and_labels"] = hal.model_dump()
+                    st.session_state["used_hint"] = False
                 except Exception as e:
                     st.error("LLM解析でエラーが発生しました。")
                     st.exception(e)
@@ -70,6 +74,34 @@ if uploaded is not None:
             header_names=hal.header_names,
         )
         st.session_state["df"] = df
+
+        # フェーズ2: 特徴要約・埋め込み・類似検索
+        db: PatternDB = load_db(pattern_path)
+        try:
+            with st.spinner("過去パターンを検索中..."):
+                columns = list(df.columns)
+                summary = summarize_columns(api_key=api_key, model=model, columns=columns)
+                [embed] = embed_texts(api_key=api_key, embedding_model=embedding_model, texts=[summary])
+                results = search_similar(db, embed, columns, top_k=1, alpha=0.8)
+        except Exception as e:
+            results = []
+            st.info("パターン検索でエラーが発生しました（スキップ）。")
+
+        hint_text = None
+        if results:
+            p, total, cos, jac = results[0]
+            if total > 0.75:  # 閾値超えでヒントとして提示
+                hint_text = f"過去の \"{p.name or p.id}\" パターンを参考に提案を作成しました"
+                st.info(hint_text)
+                # 既存ルールを初期値に適用
+                hal = HeaderAndLabels(
+                    header_row_index=hal.header_row_index,
+                    data_start_row=hal.data_start_row,
+                    header_names=hal.header_names,
+                    column_labels={**p.rules, **hal.column_labels},
+                )
+                st.session_state["header_and_labels"] = hal.model_dump()
+                st.session_state["used_hint"] = True
 
         st.subheader("AIが提案したルール案（カラム → ラベル）")
         # 編集可能UI
@@ -95,12 +127,32 @@ if uploaded is not None:
         st.subheader("プレビュー")
         st.dataframe(preview, use_container_width=True)
 
+        # パターン名はボタン外で入力させて安定化
+        pattern_name = st.text_input("パターン名（保存時に使用）", value=st.session_state.get("pattern_name", ""), key="pattern_name")
+
         col1, col2 = st.columns([1, 1])
         with col1:
             if st.button("承認"):
                 st.session_state["final_mapping"] = mapping
                 st.session_state["final_output"] = preview
                 st.success("承認しました。CSVとしてダウンロードできます。")
+                # パターン保存
+                try:
+                    columns = list(df.columns)
+                    name = st.session_state.get("pattern_name", "")
+                    summary = summarize_columns(api_key=api_key, model=model, columns=columns)
+                    try:
+                        [embed] = embed_texts(api_key=api_key, embedding_model=embedding_model, texts=[summary])
+                    except Exception as e_embed:
+                        st.warning("埋め込み生成でエラーが発生したため、列一致のみで保存します。")
+                        embed = []
+                    db = load_db(pattern_path)
+                    upsert_pattern(db, name=name, columns=columns, summary=summary, embedding=embed, rules=mapping)
+                    save_db(db, pattern_path)
+                    st.toast("パターンを保存しました。")
+                except Exception as e:
+                    st.error("パターン保存でエラーが発生しました。")
+                    st.exception(e)
 
         with col2:
             final_output: pd.DataFrame | None = st.session_state.get("final_output")
