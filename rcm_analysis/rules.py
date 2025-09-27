@@ -17,6 +17,7 @@ class ColumnRole(str, Enum):
     CONTROL = "コントロール"
     PROCEDURE = "手続"
     PREVIOUS_PROCEDURE_RESULT = "前回の手続結果"
+    SAMPLE_SIZE = "サンプル件数"
 
     @classmethod
     def from_label(cls, label: str) -> "ColumnRole":
@@ -109,7 +110,7 @@ class RuleSet:
 
         # 各役割のカラムをJSON形式で結合（指定された4つの役割のみ）
         result_data = {}
-        allowed_roles = {"リスク", "コントロール", "手続", "前回の手続結果"}
+        allowed_roles = {"リスク", "コントロール", "手続", "サンプル件数", "前回の手続結果"}
 
         for role, columns in role_columns.items():
             if role in allowed_roles and columns:

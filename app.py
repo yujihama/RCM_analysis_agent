@@ -62,6 +62,8 @@ if "pattern_name" not in st.session_state:
     st.session_state.pattern_name = ""
 if "saved_pattern_id" not in st.session_state:
     st.session_state.saved_pattern_id = None
+if "llm_analysis_completed" not in st.session_state:
+    st.session_state.llm_analysis_completed = False
 
 if uploaded_file is not None:
     try:
@@ -69,66 +71,78 @@ if uploaded_file is not None:
     except Exception as exc:
         st.error(f"ファイルの読み込みに失敗しました: {exc}")
     else:
-        st.session_state.dataframe = df
-        st.success("ファイルを読み込みました。")
-        st.dataframe(df.head(20))
+        # データフレームが変更された場合のみLLM分析を実行
+        if st.session_state.dataframe is None or not df.equals(st.session_state.dataframe):
+            st.session_state.dataframe = df
+            st.session_state.llm_analysis_completed = False
+            st.success("ファイルを読み込みました。")
+            st.dataframe(df.head(20))
 
-        with st.spinner("LLM によるカラム役割を推論中..."):
-            api_key = st.session_state.llm_api_key or env_llm_config.api_key
-            llm_config = LLMConfiguration(
-                api_key=api_key or None,
-                model=env_llm_config.model,
-                temperature=env_llm_config.temperature,
-            )
-            llm_error: Optional[LLMError] = None
-            summary = ""
-            suggestions: Dict[str, str] = {}
-            reference_record = None
-            reference_message: Optional[str] = None
-            reference_payload: Optional[Dict[str, object]] = None
+            with st.spinner("LLM によるカラム役割を推論中..."):
+                api_key = st.session_state.llm_api_key or env_llm_config.api_key
+                llm_config = LLMConfiguration(
+                    api_key=api_key or None,
+                    model=env_llm_config.model,
+                    temperature=env_llm_config.temperature,
+                )
+                llm_error: Optional[LLMError] = None
+                summary = ""
+                suggestions: Dict[str, str] = {}
+                reference_record = None
+                reference_message: Optional[str] = None
+                reference_payload: Optional[Dict[str, object]] = None
 
-            try:
-                client = LLMClient(llm_config)
-            except LLMError as exc:
-                llm_error = exc
-            else:
                 try:
-                    summary = client.summarize_dataframe(df)
+                    client = LLMClient(llm_config)
                 except LLMError as exc:
                     llm_error = exc
                 else:
-                    similar_candidates = pattern_repository.find_similar(
-                        summary=summary,
-                        columns=df.columns,
-                        limit=1,
-                    )
-                    if similar_candidates:
-                        reference_record, score = similar_candidates[0]
-                        reference_payload = dict(build_reference_payload(reference_record))
-                        reference_message = (
-                            f"過去のパターン『{reference_record.name}』(スコア {score:.2f}) を参照して提案を生成します。"
-                        )
                     try:
-                        suggestions = client.suggest_column_roles(
-                            df,
-                            reference=reference_payload,
-                        )
+                        summary = client.summarize_dataframe(df)
                     except LLMError as exc:
                         llm_error = exc
+                    else:
+                        similar_candidates = pattern_repository.find_similar(
+                            summary=summary,
+                            columns=df.columns,
+                            limit=1,
+                        )
+                        if similar_candidates:
+                            reference_record, score = similar_candidates[0]
+                            reference_payload = dict(build_reference_payload(reference_record))
+                            reference_message = (
+                                f"過去のパターン『{reference_record.name}』(スコア {score:.2f}) を参照して提案を生成します。"
+                            )
+                        try:
+                            suggestions = client.suggest_column_roles(
+                                df,
+                                reference=reference_payload,
+                            )
+                        except LLMError as exc:
+                            llm_error = exc
 
-            if llm_error:
-                st.session_state.pattern_summary = ""
-                st.session_state.reference_pattern = None
-                st.error(f"LLM の呼び出しでエラーが発生しました: {llm_error}")
+                if llm_error:
+                    st.session_state.pattern_summary = ""
+                    st.session_state.reference_pattern = None
+                    st.error(f"LLM の呼び出しでエラーが発生しました: {llm_error}")
+                else:
+                    st.session_state.pattern_summary = summary
+                    st.session_state.reference_pattern = reference_record
+                    if reference_message:
+                        st.info(reference_message)
+                    st.session_state.column_mapping = dict(suggestions)
+                    default_name = uploaded_file.name.rsplit(".", 1)[0]
+                    st.session_state.pattern_name = f"{default_name} パターン"
+                    st.session_state.saved_pattern_id = None
+                    st.session_state.llm_analysis_completed = True
+        else:
+            # データフレームが同じ場合は既存のデータを表示
+            if not st.session_state.llm_analysis_completed:
+                st.success("ファイルを読み込みました。")
+                st.dataframe(df.head(20))
+                st.session_state.llm_analysis_completed = True
             else:
-                st.session_state.pattern_summary = summary
-                st.session_state.reference_pattern = reference_record
-                if reference_message:
-                    st.info(reference_message)
-                st.session_state.column_mapping = dict(suggestions)
-                default_name = uploaded_file.name.rsplit(".", 1)[0]
-                st.session_state.pattern_name = f"{default_name} パターン"
-                st.session_state.saved_pattern_id = None
+                st.success("ファイルが既に読み込まれています。")
 
 if st.session_state.dataframe is not None:
     df = st.session_state.dataframe
@@ -136,27 +150,47 @@ if st.session_state.dataframe is not None:
     role_options = list(allowed_roles())
     current_mapping: Dict[str, str] = st.session_state.column_mapping or {}
 
+    # 変更検知のための状態管理
+    if "column_mapping_changed" not in st.session_state:
+        st.session_state.column_mapping_changed = False
+
     edited_mapping: Dict[str, str] = {}
     cols = st.columns([1, 1])
     for index, column in enumerate(df.columns):
         container = cols[index % 2]
         with container:
             role = current_mapping.get(column, "その他")
-            edited_mapping[column] = st.selectbox(
+            # 各カラムにユニークなkeyを設定
+            selectbox_key = f"role_select_{column}"
+            selected_role = st.selectbox(
                 f"{column}",
                 role_options,
                 index=role_options.index(role) if role in role_options else role_options.index("その他"),
+                key=selectbox_key,
             )
-    st.session_state.column_mapping = edited_mapping
+            edited_mapping[column] = selected_role
+
+    # 変更を検知してセッションステートを更新
+    if edited_mapping != current_mapping:
+        st.session_state.column_mapping = edited_mapping
+        st.session_state.column_mapping_changed = True
+    elif st.session_state.column_mapping_changed:
+        st.session_state.column_mapping_changed = False
 
     st.subheader("カラム結合ルールの設定")
-    combine_rules_state: Dict[str, Dict[str, object]] = st.session_state.combine_rules or {}
+    current_combine_rules: Dict[str, Dict[str, object]] = st.session_state.combine_rules or {}
     available_columns = list(df.columns)
 
+    # 変更検知のための状態管理
+    if "combine_rules_changed" not in st.session_state:
+        st.session_state.combine_rules_changed = False
+
+    combine_rules_state: Dict[str, Dict[str, object]] = {}
+
     with st.expander("結合ルールを編集"):
-        rule_names = list(combine_rules_state.keys()) or ["結合ルール1"]
+        rule_names = list(current_combine_rules.keys()) or ["結合ルール1"]
         for name in rule_names:
-            rule = combine_rules_state.setdefault(
+            rule = current_combine_rules.setdefault(
                 name,
                 {
                     "columns": [],
@@ -182,13 +216,22 @@ if st.session_state.dataframe is not None:
                 value=str(rule.get("separator", "\n")),
                 key=f"combine_sep_{name}",
             )
-        if st.button("結合ルールを追加"):
-            combine_rules_state[f"結合ルール{len(combine_rules_state) + 1}"] = {
+            combine_rules_state[name] = rule
+
+        if st.button("結合ルールを追加", key="add_combine_rule"):
+            new_rule_name = f"結合ルール{len(current_combine_rules) + 1}"
+            combine_rules_state[new_rule_name] = {
                 "columns": [],
-                "new_column": f"新規カラム{len(combine_rules_state) + 1}",
+                "new_column": f"新規カラム{len(current_combine_rules) + 1}",
                 "separator": "\n",
             }
-    st.session_state.combine_rules = combine_rules_state
+
+    # 変更を検知してセッションステートを更新
+    if combine_rules_state != current_combine_rules:
+        st.session_state.combine_rules = combine_rules_state
+        st.session_state.combine_rules_changed = True
+    elif st.session_state.combine_rules_changed:
+        st.session_state.combine_rules_changed = False
 
     rules = build_rule_set(edited_mapping, combine_rules_state.values())
     rules_json = export_rules(rules)
