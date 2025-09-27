@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Optional
@@ -15,16 +16,15 @@ class ColumnRole(str, Enum):
     RISK = "リスク"
     CONTROL = "コントロール"
     PROCEDURE = "手続"
-    OWNER = "責任者"
-    FREQUENCY = "頻度"
-    OTHER = "その他"
+    PREVIOUS_PROCEDURE_RESULT = "前回の手続結果"
 
     @classmethod
     def from_label(cls, label: str) -> "ColumnRole":
         for member in cls:
             if member.value == label:
                 return member
-        return cls.OTHER
+        # 該当する役割が見つからない場合は、特別な値としてリスクを返す（実際の処理で除外するため）
+        return cls.RISK
 
 
 @dataclass
@@ -94,13 +94,45 @@ class RuleSet:
         ]
 
     def apply(self, df: pd.DataFrame) -> pd.DataFrame:
-        """ルールを適用した DataFrame を返す。"""
+        """ルールを適用した DataFrame を返す。指定された役割のカラムのみを結合して返す。"""
 
         processed = df.copy()
-        processed = _apply_combine_rules(processed, self.combine_rules)
-        ordered_columns = [rule.column for rule in self.column_rules if rule.column in processed]
-        remaining = [col for col in processed.columns if col not in ordered_columns]
-        return processed[ordered_columns + remaining]
+
+        # 役割ごとにカラムをグループ化
+        role_columns = {}
+        for rule in self.column_rules:
+            if rule.column in processed.columns:
+                role = rule.role.value
+                if role not in role_columns:
+                    role_columns[role] = []
+                role_columns[role].append(rule.column)
+
+        # 各役割のカラムをJSON形式で結合（指定された4つの役割のみ）
+        result_data = {}
+        allowed_roles = {"リスク", "コントロール", "手続", "前回の手続結果"}
+
+        for role, columns in role_columns.items():
+            if role in allowed_roles and columns:
+                # 複数のカラムがある場合はJSON形式で結合
+                if len(columns) > 1:
+                    # 各行のJSONオブジェクトを作成
+                    def create_json_string(row):
+                        data = {}
+                        for col in columns:
+                            value = row[col]
+                            if pd.isna(value):
+                                data[col] = ""
+                            else:
+                                data[col] = str(value)
+                        return json.dumps(data, ensure_ascii=False)
+
+                    combined = processed[columns].apply(create_json_string, axis=1)
+                    result_data[role] = combined
+                else:
+                    # 1つのカラムしかない場合はそのまま（数値も文字列に変換）
+                    result_data[role] = processed[columns[0]].fillna("").astype(str)
+
+        return pd.DataFrame(result_data)
 
 
 def _apply_combine_rules(df: pd.DataFrame, combine_rules: Iterable[CombineRule]) -> pd.DataFrame:
