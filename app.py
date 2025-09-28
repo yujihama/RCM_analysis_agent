@@ -14,12 +14,35 @@ from rcm_analysis.llm_client import suggest_header_and_labels, summarize_columns
 from rcm_analysis.types import HeaderAndLabels, LABEL_OPTIONS, ColumnLabel
 from rcm_analysis.data_processing import apply_label_rules
 from rcm_analysis.patterns import PatternDB, load_db, save_db, search_similar, upsert_pattern
+from rcm_analysis.procedures import build_procedures_with_llm, procedures_to_dataframe
 
 
 load_dotenv()
 
 st.set_page_config(page_title="RCM情報抽出AIエージェント", layout="wide")
 st.title("J-SOX RCM情報抽出AIエージェント (MVP)")
+
+
+@st.fragment
+def render_processed_csv_download(csv_bytes: bytes) -> None:
+    st.download_button(
+        label="CSVダウンロード",
+        data=csv_bytes,
+        file_name="processed.csv",
+        mime="text/csv",
+        key="download_processed_csv",
+    )
+
+
+@st.fragment
+def render_procedures_csv_download(csv_bytes: bytes) -> None:
+    st.download_button(
+        label="手続明細CSVダウンロード",
+        data=csv_bytes,
+        file_name="procedures.csv",
+        mime="text/csv",
+        key="download_procedures_csv",
+    )
 
 
 def _clear_session_except(keys_to_keep: set[str]) -> None:
@@ -32,10 +55,9 @@ with st.sidebar:
     st.header("設定")
     default_api_key = os.environ.get("OPENAI_API_KEY", "")
     api_key = st.text_input("OpenAI API Key", value=default_api_key, type="password")
-    model = st.text_input("モデル名", value=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"))
-    embedding_model = st.text_input("埋め込みモデル名", value=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"))
+    model = st.text_input("モデル名", value=os.environ.get("OPENAI_MODEL", "gpt-4.1-mini"))
+    embedding_model = st.text_input("埋め込みモデル名", value=os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large"))
     pattern_path = st.text_input("パターンDBパス", value=os.environ.get("PATTERN_DB_PATH", "patterns.json"))
-    st.caption("エラーはフォールバックせずそのまま表示します")
 
 
 uploaded = st.file_uploader("CSV/Excelファイルをアップロード", type=["csv", "xlsx", "xls"], accept_multiple_files=False)
@@ -65,6 +87,7 @@ if uploaded is not None:
 
     # ヘッダー決定後のDataFrame読み込み
     if "header_and_labels" in st.session_state:
+        # セッション内のラベル案を常にソースオブトゥルースにする
         hal = HeaderAndLabels.model_validate(st.session_state["header_and_labels"])
         df = read_dataframe_with_header(
             file_bytes=file_bytes,
@@ -75,22 +98,28 @@ if uploaded is not None:
         )
         st.session_state["df"] = df
 
-        # フェーズ2: 特徴要約・埋め込み・類似検索
+        # フェーズ2: 特徴要約・埋め込み・類似検索（セッション済みならスキップ）
         db: PatternDB = load_db(pattern_path)
-        try:
-            with st.spinner("過去パターンを検索中..."):
-                columns = list(df.columns)
-                summary = summarize_columns(api_key=api_key, model=model, columns=columns)
-                [embed] = embed_texts(api_key=api_key, embedding_model=embedding_model, texts=[summary])
-                results = search_similar(db, embed, columns, top_k=1, alpha=0.8)
-        except Exception as e:
-            results = []
-            st.info("パターン検索でエラーが発生しました（スキップ）。")
+        columns = list(df.columns)
+        if st.session_state.get("pattern_search_done", False):
+            results = st.session_state.get("pattern_results", [])
+        else:
+            try:
+                with st.spinner("過去パターンを検索中..."):
+                    summary = summarize_columns(api_key=api_key, model=model, columns=columns)
+                    [embed] = embed_texts(api_key=api_key, embedding_model=embedding_model, texts=[summary])
+                    results = search_similar(db, embed, columns, top_k=1, alpha=0.8)
+                # セッションへ保存（以後の再実行でスキップ）
+                st.session_state["pattern_results"] = results
+                st.session_state["pattern_search_done"] = True
+            except Exception as e:
+                results = []
+                st.info("パターン検索でエラーが発生しました（スキップ）。")
 
         hint_text = None
         if results:
             p, total, cos, jac = results[0]
-            if total > 0.75:  # 閾値超えでヒントとして提示
+            if total > 0.75 and not st.session_state.get("used_hint", False):  # 閾値超えでヒントとして提示（初回のみ）
                 hint_text = f"過去の \"{p.name or p.id}\" パターンを参考に提案を作成しました"
                 st.info(hint_text)
                 # 既存ルールを初期値に適用
@@ -121,8 +150,17 @@ if uploaded is not None:
 
             submitted = st.form_submit_button("プレビュー更新")
 
-        # プレビュー（フォーム送信で更新）
-        mapping = edited if submitted else hal.column_labels
+        # プレビュー（フォーム送信で更新）。送信時はセッションのラベル案を更新して固定
+        if submitted:
+            st.session_state["header_and_labels"] = HeaderAndLabels(
+                header_row_index=hal.header_row_index,
+                data_start_row=hal.data_start_row,
+                header_names=hal.header_names,
+                column_labels=edited,
+            ).model_dump()
+            mapping = edited
+        else:
+            mapping = hal.column_labels
         preview = apply_label_rules(st.session_state["df"], mapping)
         st.subheader("プレビュー")
         st.dataframe(preview, use_container_width=True)
@@ -158,12 +196,24 @@ if uploaded is not None:
             final_output: pd.DataFrame | None = st.session_state.get("final_output")
             if final_output is not None:
                 csv_bytes = final_output.to_csv(index=False).encode("utf-8-sig")
-                st.download_button(
-                    label="CSVダウンロード",
-                    data=csv_bytes,
-                    file_name="processed.csv",
-                    mime="text/csv",
-                )
+                render_processed_csv_download(csv_bytes)
+
+        # --- 精査機能（フェーズ3） ---
+        st.markdown("---")
+        st.subheader("各手続の精査と構造化")
+        if st.button("手続を分割・判定する"):
+            try:
+                items = build_procedures_with_llm(preview, api_key=api_key, model=model)
+                proc_df = procedures_to_dataframe(items)
+                st.session_state["proc_df"] = proc_df
+            except Exception as e:
+                st.error("LLM解析でエラーが発生しました。")
+                st.exception(e)
+        proc_df: pd.DataFrame | None = st.session_state.get("proc_df")
+        if proc_df is not None:
+            st.dataframe(proc_df, use_container_width=True)
+            csv_bytes = proc_df.to_csv(index=False).encode("utf-8-sig")
+            render_procedures_csv_download(csv_bytes)
 
 else:
     st.info("左のサイドバーでAPIキーを設定し、ファイルをアップロードしてください。")
