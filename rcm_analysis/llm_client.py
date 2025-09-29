@@ -124,8 +124,8 @@ def _build_messages_for_procedure_analysis(
                 with open(path, "r", encoding="utf-8") as f:
                     text = f.read().strip()
                     # 安全のため長すぎる場合は一部のみ添付
-                    if len(text) > 8000:
-                        return text[:8000] + "\n\n...（以降は省略。必要に応じて原本を参照してください）"
+                    if len(text) > 10000:
+                        return text[:10000] + "\n\n...（以降は省略。必要に応じて原本を参照してください）"
                     return text
         except Exception:
             pass
